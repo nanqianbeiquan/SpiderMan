@@ -1,0 +1,276 @@
+package nacao;
+
+import java.sql.ResultSet;
+import java.util.Date;
+import java.util.HashSet;
+
+import tools.ConnectNetWork;
+import tools.JobConfig;
+import tools.Logger;
+import tools.MSSQLClient;
+import tools.SysConfig;
+
+public class NacaoUpdateJob3 {
+
+	public MSSQLClient dbClient;	
+	public static String processID;
+	public int totalUpdateCnt=0;
+	public int totalUpdateBatchCnt=0;
+	
+	public String host; //当前任务的IP
+	public NacaoOrgSearcherTest searcher;
+	
+	public int batchSize=50;
+	public int startBaseCode;
+
+	public int stopBaseCode;
+	public String changeIP="null";
+	public Logger logger;
+	
+	static String codeTable="NacaoOrg";
+	static String srcTable="OrgCode_Province";
+	static String processTable="ProcessStatusLnGs";
+	
+	Date stopTime=SysConfig.sdf.parse(SysConfig.sdf.format(new Date()).substring(0,10)+" 17:45:00");
+	HashSet<String> batchSet=new HashSet<String>();
+	
+	public NacaoUpdateJob3(String ip) throws Exception
+	{
+		host=ip;
+		dbClient=new MSSQLClient(
+				String.format("jdbc:sqlserver://%s:1433;DatabaseName=%s",SysConfig.MSSQL_HOST,SysConfig.MSSQL_DB),
+				SysConfig.MSSQL_USER, //user
+				SysConfig.MSSQL_PWD, //pwd
+				false //autoCommit
+				);
+		registerProcess();
+		logger=new Logger(processID.replace(":","#"));
+	}
+
+	public void initSearcher(String fireFoxPath) throws Exception
+	{
+		searcher=new NacaoOrgSearcherTest();
+		searcher.setLogger(logger);
+		if(!fireFoxPath.equals("default"))
+		{
+			logger.info("fireFoxPath:"+fireFoxPath);
+			searcher.setFireFoxPath(fireFoxPath);
+		}
+		searcher.initDriver();
+	}
+	
+	public void registerProcess() throws Exception
+	{
+		String sql0=String.format("select 'LnGs_'+convert(varchar(19),GETDATE(),120)+'_'+right('000'+cast(count(*) as varchar(3)),3) "
+				+"from "
+				+ processTable+"(tablockx) "
+				+"where substring(processID,6,10)=convert(varchar(10),GETDATE(),120)");
+		ResultSet res0 = dbClient.execute(sql0);
+		res0.next();
+		processID=res0.getString(1);
+		res0.close();
+		
+		String sql1=String.format("insert into "+processTable+"(processID,host) values('%s','%s')", processID,host);
+		dbClient.execute(sql1);
+		dbClient.commit();
+	}
+	
+	public void run() throws Exception
+	{
+		while(true)
+		{
+			//10分钟没有更新过的进程，认为进程已死亡,接管该进程任务
+			String sql0="select min(processID) from "
+					+ srcTable+"(tablockx) "
+					+ "where updateStatus=-1 "
+					+ "and lastUpdateTime is not null "
+					+ "and DATEDIFF(minute,lastUpdateTime,GETDATE())>10";
+			ResultSet res0= dbClient.execute(sql0);
+			if(res0.next()==true && res0.getObject(1)!=null)
+			{
+				String pid=res0.getString(1);
+				res0.close();
+				String sql1=String.format("update %s set lastUpdateTime=getDate() "
+						+ ",processID='%s' "
+						+ "where processID='%s' and updateStatus=-1",srcTable,processID,pid);
+				dbClient.execute(sql1);
+				dbClient.commit();
+			}
+			else
+			{
+				String sql2=String.format("update %s "
+						+ "set updateStatus=-1, host='%s', processID='%s',lastUpdateTime=getDate() "
+						+ "where code in "
+						+ "(select top %d code from %s where updateStatus is null)",
+						srcTable,host,processID,batchSize,srcTable);
+				dbClient.execute(sql2);
+				dbClient.commit();
+			}
+			
+			String sql3=String.format("select code from %s(tablockx) "
+					+ "where processID='%s' and updateStatus=-1",srcTable,processID);
+			
+			ResultSet res3=dbClient.execute(sql3);
+	
+			while(res3.next()==true)
+			{
+				batchSet.add(res3.getString(1));
+			}
+			res3.close();
+			dbClient.commit();
+			if(batchSet.size()>0)
+			{
+				totalUpdateCnt+=batchSet.size();
+				updateBatch();
+				dbClient.statement.clearBatch();
+				batchSet.clear();
+				
+			}
+			else
+			{
+				logger.info("Update complete!");
+				break;
+			}			
+			searcher.quitDriver();
+			//如果设置adsl换ip,重拨一次
+			if(changeIP.equals("ADSL"))
+			{
+				logger.info("ADSL is reconnecting...");
+				if(ConnectNetWork.reconnect()==false)
+				{
+					logger.info("ADSL reconnecting failed!");
+					logger.close();
+					System.exit(1);
+				}
+				else
+				{
+					logger.info("ADSL reconnecting succeed!");
+				}
+			}
+			searcher.initDriver();
+			
+			//到停止时间后，修改进程状态，退出程序。
+			if(new Date().after(stopTime))
+			{
+				logger.info("Time is up,job completed!");
+				break;
+			}
+		}
+
+		dbClient.execute(String.format("update "+processTable+" set lastUpdateStatus='9' where processID='%s'",processID));
+		dbClient.commit();
+		dbClient.close();
+		searcher.quitDriver();
+		logger.close();
+		System.exit(0);
+	}
+	
+	public int updateBatch() throws Exception
+	{
+		logger.info("Current batch start base code:"+startBaseCode);
+		logger.info("Current process update numbers:"+totalUpdateCnt);
+		int lastUpdateStatus=0;
+		for(String orgCode:batchSet)
+		{
+			try
+			{
+				totalUpdateCnt++;				
+				NACAO nacao=null;
+				for(int i=0;i<SysConfig.MAX_TRY_TIMES;i++)
+				{
+					nacao=searcher.search(orgCode);
+					if(nacao.updateStatus==0 || nacao.updateStatus==1)
+					{
+						break;
+					}
+					else if(nacao.updateStatus==3)
+					{
+						logger.info("Time out exception,searcher again...");
+						continue;
+					}
+					else if(nacao.updateStatus==2)
+					{
+						logger.info("Submit search request failed!");
+						continue;
+					}
+					else if(nacao.updateStatus==6)
+					{
+						logger.info("Web driver may be died!");
+						throw new Exception("Web driver may be died!");
+					}
+					else
+					{
+						logger.info("Search job failed.Check log for more information.");
+						throw new Exception("Search job failed.Check log for more information.");
+					}
+				}
+				if(nacao.updateStatus==0 || nacao.updateStatus==1)
+				{
+					String[] colsAndVals=nacao.getColsAndVals();
+					colsAndVals[0]+=",lastUpdateTime,host";
+					colsAndVals[1]+=",getDate(),"+"'"+host+"'";
+
+					String insertSql=String.format("insert into %s(%s) values(%s)",codeTable,colsAndVals[0],colsAndVals[1]);
+					String updateSqlSrc=String.format("update %s set updateStatus=%f,lastUpdateTime=getDate() "
+							+ "where code='%s'", 
+							srcTable,nacao.updateStatus,orgCode);
+					
+					dbClient.statement.addBatch(insertSql);
+					dbClient.statement.addBatch(updateSqlSrc);
+					logger.info("orgCode:"+orgCode+",updateStatus:"+nacao.updateStatus);
+				}
+				else
+				{
+					logger.info("Search job failed after tried "+SysConfig.MAX_TRY_TIMES+" times");
+					throw new Exception("Search job failed after tried "+SysConfig.MAX_TRY_TIMES+" times");
+				}
+			}
+			catch (Exception e)
+			{
+				e.printStackTrace();
+				lastUpdateStatus=1;
+				if(searcher.driverStatus==0)
+				{
+					searcher.quitDriver();
+				}
+				logger.close();
+				
+				String sql4=String.format("update %s set "
+						+ "lastUpdateStatus='%d',"
+						+ "totalUpdateCnt='%d',"
+						+ "lastUpdateTime=getDate() "
+						+ "where processID='%s'",processTable,lastUpdateStatus,totalUpdateCnt,processID);
+				dbClient.statement.addBatch(sql4);
+				dbClient.statement.executeBatch();
+				dbClient.commit();
+				dbClient.commit();
+				System.exit(1);
+			}
+		}
+		String sql4=String.format("update %s set "
+				+ "lastUpdateStatus='%d',"
+				+ "totalUpdateCnt='%d',"
+				+ "lastUpdateTime=getDate() "
+				+ "where processID='%s'",processTable,lastUpdateStatus,totalUpdateCnt,processID);
+		dbClient.statement.addBatch(sql4);
+		dbClient.statement.executeBatch();
+		dbClient.commit();
+
+		return lastUpdateStatus;
+	}
+	
+	public static void run(JobConfig jobConf) throws Exception
+	{
+		
+		NacaoUpdateJob3 job = new NacaoUpdateJob3(jobConf.getString("host"));
+		job.initSearcher("default");
+		job.run();
+	}
+
+	public static void main(String[] args) throws Exception
+	{
+		NacaoUpdateJob3 job = new NacaoUpdateJob3("localhost");
+		job.initSearcher("default");
+		job.run();
+	}
+}
